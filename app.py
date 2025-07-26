@@ -1,0 +1,195 @@
+import streamlit as st
+import pandas as pd
+import openai
+import random
+import os
+import matplotlib.pyplot as plt
+from io import BytesIO
+from dotenv import load_dotenv
+
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+MODEL_NAME = "gpt-4o-mini"
+
+TIPS = [
+    "Unplug chargers and devices when not in use.",
+    "Switch to LED bulbs for lower power consumption.",
+    "Do laundry with full loads and use cold water cycles.",
+    "Turn off lights in empty rooms.",
+    "Use natural daylight instead of electric lighting.",
+    "Set your thermostat a few degrees lower in winter.",
+    "Seal windows and doors to prevent heat/cool loss.",
+    "Use ceiling fans to reduce AC usage.",
+    "Defrost your fridge/freezer regularly.",
+    "Take shorter showers to save hot water."
+]
+
+def get_random_tip():
+    return random.choice(TIPS)
+
+def analyze_usage(df):
+    usage_col = None
+    for col in df.columns:
+        if "usage" in col.lower():
+            usage_col = col
+            break
+    if usage_col is None:
+        return None
+    total = df[usage_col].sum()
+    avg = df[usage_col].mean()
+    max_day = df.loc[df[usage_col].idxmax()]
+    summary = {
+        "total": total,
+        "average": avg,
+        "peak_day": max_day.get("Date", "Unknown"),
+        "peak_usage": max_day[usage_col]
+    }
+    return summary
+
+def plot_usage(df):
+    if "Date" not in df.columns:
+        return None
+    df['Date'] = pd.to_datetime(df['Date'])
+    usage_col = None
+    for col in df.columns:
+        if "usage" in col.lower():
+            usage_col = col
+            break
+    if usage_col is None:
+        return None
+    daily_usage = df.groupby('Date')[usage_col].sum()
+    fig, ax = plt.subplots()
+    daily_usage.plot(ax=ax)
+    ax.set_title("Daily Energy Usage")
+    ax.set_ylabel("kWh")
+    ax.set_xlabel("Date")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    return fig
+
+def suggest_optimized_times(df):
+    if "Date" not in df.columns or "Usage" not in df.columns:
+        return "Your CSV should have 'Date' and 'Usage' columns for time optimization."
+    df['Date'] = pd.to_datetime(df['Date'])
+    df['hour'] = df['Date'].dt.hour
+    by_hour = df.groupby('hour')['Usage'].mean()
+    best_hours = by_hour.nsmallest(3).index.tolist()
+    return f"Suggested hours for appliance use (lowest average usage): {', '.join(str(h) + ':00' for h in best_hours)}"
+
+def estimate_bill(df, rate_per_kwh=0.15):
+    usage_col = None
+    for col in df.columns:
+        if "usage" in col.lower():
+            usage_col = col
+            break
+    if usage_col is None:
+        return "Could not estimate bill: no energy usage column found."
+    total_kwh = df[usage_col].sum()
+    bill = total_kwh * rate_per_kwh
+    return f"Estimated bill: ${bill:.2f} (at ${rate_per_kwh}/kWh)"
+
+def openai_chat(messages):
+    openai.api_key = OPENAI_API_KEY
+    try:
+        response = openai.ChatCompletion.create(
+            model=MODEL_NAME,
+            messages=messages,
+            temperature=0.5,
+            max_tokens=400
+        )
+        return response.choices[0].message.content.strip()
+    except Exception:
+        return None
+
+# --- Streamlit UI ---
+st.set_page_config(page_title="WattWise AI Chatbot", page_icon="⚡")
+st.title("WattWise AI: Your Energy Efficiency Assistant ⚡")
+
+st.sidebar.header("Random Energy-Saving Tip")
+st.sidebar.success(get_random_tip())
+st.sidebar.markdown("### Expected CSV format")
+st.sidebar.code("Date,Usage\n2025-07-24,12.5\n2025-07-25,15.2")
+
+uploaded_file = st.sidebar.file_uploader("Upload your energy_usage.csv", type="csv")
+df = None
+if uploaded_file:
+    try:
+        df = pd.read_csv(uploaded_file)
+        st.sidebar.info("CSV uploaded successfully!")
+    except Exception as e:
+        st.sidebar.error(f"Error reading CSV: {e}")
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = [
+        {"role": "system", "content": "You are WattWise, a friendly expert on home energy efficiency. If the user uploads energy usage data, use it for personalized answers and suggestions."}
+    ]
+if "responses" not in st.session_state:
+    st.session_state.responses = []
+
+st.markdown("### Chat with WattWise")
+user_query = st.text_input("Ask me anything about saving electricity, usage analysis, optimized appliance times, or bills:")
+
+if st.button("Send") and user_query:
+    st.session_state.chat_history.append({"role": "user", "content": user_query})
+    data_summary = ""
+    if df is not None:
+        if "analyze" in user_query.lower() or "summary" in user_query.lower():
+            summary = analyze_usage(df)
+            if summary:
+                data_summary = (
+                    f"Total usage: {summary['total']:.2f} kWh\n"
+                    f"Average daily usage: {summary['average']:.2f} kWh\n"
+                    f"Peak usage day: {summary['peak_day']} with {summary['peak_usage']:.2f} kWh"
+                )
+        elif "suggest" in user_query.lower() or "time" in user_query.lower():
+            data_summary = suggest_optimized_times(df)
+        elif "bill" in user_query.lower() or "cost" in user_query.lower():
+            data_summary = estimate_bill(df)
+    messages = st.session_state.chat_history.copy()
+    if data_summary:
+        messages.append({"role": "system", "content": f"User's energy data summary: {data_summary}"})
+    reply = openai_chat(messages)
+    if reply is None:
+        # Fallback
+        if "tip" in user_query.lower() or "save" in user_query.lower():
+            reply = "Here are some tips for saving electricity at home:\n" + "\n".join(f"- {tip}" for tip in TIPS)
+        elif "analyze" in user_query.lower() and df is not None:
+            reply = data_summary
+        elif "bill" in user_query.lower() and df is not None:
+            reply = estimate_bill(df)
+        else:
+            reply = "Sorry, I couldn't reach my AI brain. Try asking for tips or upload usage data for analysis!"
+    st.session_state.responses.append((user_query, reply))
+    st.session_state.chat_history.append({"role": "assistant", "content": reply})
+
+for i, (q, r) in enumerate(st.session_state.responses):
+    st.markdown(f"**You:** {q}")
+    st.markdown(f"**WattWise:** {r}")
+
+if df is not None:
+    st.markdown("### Your Uploaded Energy Usage Data")
+    st.dataframe(df)
+    fig = plot_usage(df)
+    if fig:
+        st.pyplot(fig)
+# Load WattWise FAQ questions
+question_df = None
+try:
+    question_df = pd.read_csv("wattwise_questions.csv")
+except FileNotFoundError:
+    st.warning("⚠️ 'wattwise_questions.csv' not found in the project folder.")
+st.markdown("---")
+st.markdown("### 🔎 Search WattWise Question Bank")
+
+if question_df is not None:
+    search_query = st.text_input("Search from 1000+ common energy queries:")
+    if search_query:
+        matching_qs = question_df[question_df['question'].str.contains(search_query, case=False, na=False)]
+        if not matching_qs.empty:
+            st.markdown("#### 📋 Matching Questions:")
+            for i, q in enumerate(matching_qs['question'].head(10), 1):
+                st.markdown(f"{i}. {q}")
+        else:
+            st.info("No matching questions found.")
+else:
+    st.info("Upload CSV or place `wattwise_questions.csv` in the same folder.")
